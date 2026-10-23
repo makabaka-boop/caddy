@@ -15,9 +15,12 @@
 package logging
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +47,7 @@ func init() {
 	caddy.RegisterModule(RegexpFilter{})
 	caddy.RegisterModule(RenameFilter{})
 	caddy.RegisterModule(MultiRegexpFilter{})
+	caddy.RegisterModule(JSONRedactFilter{})
 }
 
 // LogFieldFilter can filter (or manipulate)
@@ -1059,6 +1063,285 @@ func (f *RenameFilter) Filter(in zapcore.Field) zapcore.Field {
 	return in
 }
 
+// redactedValue is the replacement value inserted by the JSON redaction filter.
+const redactedValue = "[REDACTED]"
+
+// JSONRedactFilter is a Caddy log field filter that redacts
+// the values at the given RFC 6901 JSON Pointer locations
+// in a string field containing a JSON document.
+//
+// The value at each selected location is replaced in its
+// entirety with the string "[REDACTED]"; both object members
+// and array elements may be selected. Locations that do not
+// exist in the document are skipped, nothing is created, and
+// all unselected content keeps its original value and type.
+// The field value remains a JSON text string, though it may
+// be reformatted.
+//
+// If the field value is not one complete JSON document, the
+// whole field value is replaced with the string "[REDACTED]"
+// and the original content is not preserved.
+//
+// This filter only operates on string fields; fields of any
+// other type are left unchanged. It only affects what is
+// written to the logs, never the response received by a
+// client.
+type JSONRedactFilter struct {
+	// Pointers is the list of RFC 6901 JSON Pointers
+	// identifying the values to redact. At least one
+	// pointer is required.
+	Pointers []string `json:"pointers,omitempty"`
+
+	// pointers are the parsed reference tokens for each
+	// configured pointer, in configuration order.
+	pointers [][]string
+}
+
+// CaddyModule returns the Caddy module information.
+func (JSONRedactFilter) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "caddy.logging.encoders.filter.json_redact",
+		New: func() caddy.Module { return new(JSONRedactFilter) },
+	}
+}
+
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
+//
+//	json_redact <pointer...> {
+//	    pointer <pointer>
+//	}
+//
+// At least one RFC 6901 JSON Pointer must be provided, either
+// as an inline argument or via a `pointer` subdirective.
+func (f *JSONRedactFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume filter name
+
+	f.Pointers = append(f.Pointers, d.RemainingArgs()...)
+
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "pointer":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			f.Pointers = append(f.Pointers, d.Val())
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+		default:
+			return d.Errf("unrecognized subdirective %s", d.Val())
+		}
+	}
+
+	if len(f.Pointers) == 0 {
+		return d.Err("json_redact filter requires at least one JSON pointer")
+	}
+
+	return nil
+}
+
+// Provision parses the configured JSON pointers so that
+// malformed pointers are reported when the configuration
+// is loaded, rather than while logging.
+func (f *JSONRedactFilter) Provision(_ caddy.Context) error {
+	f.pointers = make([][]string, 0, len(f.Pointers))
+	for _, raw := range f.Pointers {
+		tokens, err := parseJSONPointer(raw)
+		if err != nil {
+			return fmt.Errorf("invalid JSON pointer %q: %v", raw, err)
+		}
+		f.pointers = append(f.pointers, tokens)
+	}
+	return nil
+}
+
+// Validate ensures that at least one pointer is configured.
+func (f *JSONRedactFilter) Validate() error {
+	if len(f.Pointers) == 0 {
+		return fmt.Errorf("json_redact filter requires at least one JSON pointer")
+	}
+	return nil
+}
+
+// Filter redacts the configured JSON Pointer locations of
+// the input field.
+func (f *JSONRedactFilter) Filter(in zapcore.Field) zapcore.Field {
+	// only string fields carry a JSON document to filter
+	if in.Type != zapcore.StringType {
+		return in
+	}
+
+	// UseNumber decodes JSON numbers without lossy float
+	// conversion so unselected numeric values round-trip
+	// with their original value and type.
+	dec := json.NewDecoder(strings.NewReader(in.String))
+	dec.UseNumber()
+
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		in.String = redactedValue
+		return in
+	}
+	// the value must be a single complete JSON document;
+	// trailing values mean it is not
+	if dec.More() {
+		in.String = redactedValue
+		return in
+	}
+
+	for _, tokens := range f.pointers {
+		doc = redactJSONPointer(doc, tokens)
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(doc); err != nil {
+		in.String = redactedValue
+		return in
+	}
+	in.String = strings.TrimSuffix(buf.String(), "\n")
+
+	return in
+}
+
+// parseJSONPointer parses an RFC 6901 JSON Pointer into its
+// reference tokens. The empty pointer, which references the
+// whole document, results in no tokens.
+func parseJSONPointer(raw string) ([]string, error) {
+	if raw == "" {
+		return []string{}, nil
+	}
+	if raw[0] != '/' {
+		return nil, errors.New("non-empty JSON pointer must begin with '/'")
+	}
+
+	rawTokens := strings.Split(raw[1:], "/")
+	tokens := make([]string, 0, len(rawTokens))
+	for _, rawToken := range rawTokens {
+		token, err := unescapeJSONPointerToken(rawToken)
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, nil
+}
+
+// unescapeJSONPointerToken unescapes the "~0" and "~1"
+// sequences in an RFC 6901 reference token. Any other "~"
+// escape is invalid.
+func unescapeJSONPointerToken(token string) (string, error) {
+	if !strings.ContainsRune(token, '~') {
+		return token, nil
+	}
+
+	var b strings.Builder
+	for i := 0; i < len(token); i++ {
+		if token[i] != '~' {
+			b.WriteByte(token[i])
+			continue
+		}
+		if i+1 >= len(token) {
+			return "", errors.New("invalid escape sequence '~': must be '~0' or '~1'")
+		}
+		switch token[i+1] {
+		case '0':
+			b.WriteRune('~')
+		case '1':
+			b.WriteRune('/')
+		default:
+			return "", fmt.Errorf("invalid escape sequence '~%c': must be '~0' or '~1'", token[i+1])
+		}
+		i++
+	}
+	return b.String(), nil
+}
+
+// redactJSONPointer replaces the value at the given RFC 6901
+// reference tokens with the redaction string and returns the
+// document. Locations that do not exist, or whose parent is
+// neither an object nor an array, are skipped.
+func redactJSONPointer(doc any, tokens []string) any {
+	if len(tokens) == 0 {
+		// the empty pointer references the whole document
+		return redactedValue
+	}
+
+	// navigate to the parent of the selected value
+	parent := doc
+	for _, token := range tokens[:len(tokens)-1] {
+		switch node := parent.(type) {
+		case map[string]any:
+			child, ok := node[token]
+			if !ok {
+				return doc
+			}
+			parent = child
+		case []any:
+			index, ok := jsonPointerArrayIndex(token, len(node))
+			if !ok {
+				return doc
+			}
+			parent = node[index]
+		default:
+			return doc
+		}
+	}
+
+	lastToken := tokens[len(tokens)-1]
+	switch node := parent.(type) {
+	case map[string]any:
+		if _, ok := node[lastToken]; !ok {
+			return doc
+		}
+		node[lastToken] = redactedValue
+	case []any:
+		index, ok := jsonPointerArrayIndex(lastToken, len(node))
+		if !ok {
+			return doc
+		}
+		node[index] = redactedValue
+	default:
+		return doc
+	}
+
+	return doc
+}
+
+// jsonPointerArrayIndex resolves an RFC 6901 array index
+// reference token. The "-" token references the nonexistent
+// element one past the end, leading zeros are forbidden
+// (except for "0" itself), and the index must be in range.
+func jsonPointerArrayIndex(token string, length int) (int, bool) {
+	if token == "-" {
+		return 0, false
+	}
+	if len(token) == 0 {
+		return 0, false
+	}
+	if len(token) > 1 && token[0] == '0' {
+		return 0, false
+	}
+
+	index := 0
+	for i := 0; i < len(token); i++ {
+		digit := token[i]
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
+		if index > (math.MaxInt-int(digit-'0'))/10 {
+			return 0, false
+		}
+		index = index*10 + int(digit-'0')
+	}
+
+	if index >= length {
+		return 0, false
+	}
+	return index, true
+}
+
 // Interface guards
 var (
 	_ LogFieldFilter = (*DeleteFilter)(nil)
@@ -1071,6 +1354,7 @@ var (
 	_ LogFieldFilter = (*RegexpFilter)(nil)
 	_ LogFieldFilter = (*RenameFilter)(nil)
 	_ LogFieldFilter = (*MultiRegexpFilter)(nil)
+	_ LogFieldFilter = (*JSONRedactFilter)(nil)
 
 	_ caddyfile.Unmarshaler = (*DeleteFilter)(nil)
 	_ caddyfile.Unmarshaler = (*HashFilter)(nil)
@@ -1082,12 +1366,15 @@ var (
 	_ caddyfile.Unmarshaler = (*RegexpFilter)(nil)
 	_ caddyfile.Unmarshaler = (*RenameFilter)(nil)
 	_ caddyfile.Unmarshaler = (*MultiRegexpFilter)(nil)
+	_ caddyfile.Unmarshaler = (*JSONRedactFilter)(nil)
 
 	_ caddy.Provisioner = (*IPMaskFilter)(nil)
 	_ caddy.Provisioner = (*RegexpFilter)(nil)
 	_ caddy.Provisioner = (*MultiRegexpFilter)(nil)
+	_ caddy.Provisioner = (*JSONRedactFilter)(nil)
 
 	_ caddy.Validator = (*QueryFilter)(nil)
 	_ caddy.Validator = (*SetCookieFilter)(nil)
 	_ caddy.Validator = (*MultiRegexpFilter)(nil)
+	_ caddy.Validator = (*JSONRedactFilter)(nil)
 )

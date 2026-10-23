@@ -29,6 +29,11 @@ log {
 		request>client_ip ip_mask 16 32
 		request>headers>Regexp regexp secret REDACTED
 		request>headers>Hash hash
+		body json_redact /user/password
+		body>metadata json_redact {
+			pointer /secret
+			pointer /tokens/0
+		}
 	}
 }
 ----------
@@ -46,6 +51,19 @@ log {
 				},
 				"encoder": {
 					"fields": {
+						"body": {
+							"filter": "json_redact",
+							"pointers": [
+								"/user/password"
+							]
+						},
+						"body\u003emetadata": {
+							"filter": "json_redact",
+							"pointers": [
+								"/secret",
+								"/tokens/0"
+							]
+						},
 						"request\u003eclient_ip": {
 							"filter": "ip_mask",
 							"ipv4_cidr": 16,
