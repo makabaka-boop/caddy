@@ -50,6 +50,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				return nil, h.ArgErr()
 			}
 			rb.Set = setStr
+
+		case "verify_content_digest":
+			if h.NextArg() {
+				return nil, h.ArgErr()
+			}
+			rb.VerifyContentDigest = true
+
 		default:
 			return nil, h.Errf("unrecognized request_body subdirective '%s'", h.Val())
 		}

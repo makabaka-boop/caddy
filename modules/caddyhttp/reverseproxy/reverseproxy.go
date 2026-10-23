@@ -837,7 +837,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 			userOps.ApplyToRequest(r)
 		}
 	}
-	if !requestWasIncremental && requestHasContent(r) && caddyhttp.IsIncremental(r.Header) &&
+	if !requestWasIncremental && caddyhttp.RequestHasContent(r) && caddyhttp.IsIncremental(r.Header) &&
 		(h.RequestBuffers != 0 || r.ContentLength < 0 && h.transportRequiresContentLength()) {
 		return true, h.refuseIncremental(w, nil)
 	}
@@ -2156,29 +2156,8 @@ func responseHasContent(req *http.Request, res *http.Response) bool {
 	return true
 }
 
-// requestHasContent reports whether r may carry content that matters for
-// incremental forwarding. HTTP/3 uses an unknown length for bodyless GET and
-// HEAD requests (see issue #6678), so their usual no-body semantics are used
-// rather than waiting for the request stream to end.
-func requestHasContent(r *http.Request) bool {
-	if r.ContentLength > 0 {
-		return true
-	}
-	if r.ContentLength == 0 {
-		return false
-	}
-
-	switch r.Method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions,
-		http.MethodDelete, http.MethodTrace, http.MethodConnect:
-		return false
-	}
-
-	return true
-}
-
 func normalizeIncrementalRequest(req *http.Request) {
-	if caddyhttp.IsIncremental(req.Header) && !requestHasContent(req) {
+	if caddyhttp.IsIncremental(req.Header) && !caddyhttp.RequestHasContent(req) {
 		// HTTP/3 can represent a bodyless GET or HEAD with an unknown length.
 		// Do not pass that sentinel to transports that require framing.
 		req.ContentLength = 0
@@ -2189,7 +2168,7 @@ func normalizeIncrementalRequest(req *http.Request) {
 // incrementalRequestConflicts reports whether honouring an incremental request
 // would override an explicit buffer or violate the transport's framing needs.
 func (h *Handler) incrementalRequestConflicts(req *http.Request) bool {
-	if !requestHasContent(req) || !caddyhttp.IsIncremental(req.Header) {
+	if !caddyhttp.RequestHasContent(req) || !caddyhttp.IsIncremental(req.Header) {
 		return false
 	}
 	needsLength := h.transportRequiresContentLength()

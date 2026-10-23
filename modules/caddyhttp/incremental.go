@@ -51,3 +51,24 @@ func IsIncremental(hdr http.Header) bool {
 
 	return ok && b
 }
+
+// RequestHasContent reports whether r may carry content that matters for
+// incremental forwarding. HTTP/3 uses an unknown length for bodyless GET and
+// HEAD requests (see issue #6678), so their usual no-body semantics are used
+// rather than waiting for the request stream to end.
+func RequestHasContent(r *http.Request) bool {
+	if r.ContentLength > 0 {
+		return true
+	}
+	if r.ContentLength == 0 {
+		return false
+	}
+
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions,
+		http.MethodDelete, http.MethodTrace, http.MethodConnect:
+		return false
+	}
+
+	return true
+}
